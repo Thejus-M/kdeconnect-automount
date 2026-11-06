@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep the KDE Connect phone filesystem mounted
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/home/pc/.local/bin/kdeconnect-automount
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

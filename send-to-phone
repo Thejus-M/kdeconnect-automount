@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Nautilus script: send the selected files to the phone with the KDE Connect
+# share plugin. The phone's own app writes them into Download, so this works
+# even for paths the sshfs mount refuses.
+set -uo pipefail
+
+DEVICE_ID="${KDECONNECT_DEVICE_ID:-150d0bca93184e81b4433787ea73d461}"
+
+sent=0
+errors=""
+while IFS= read -r f; do
+  [[ -n $f ]] || continue
+  if [[ -d $f ]]; then
+    errors+="$(basename "$f"): directories cannot be shared"$'\n'
+    continue
+  fi
+  if err=$(kdeconnect-cli -d "$DEVICE_ID" --share "$f" 2>&1); then
+    sent=$((sent + 1))
+  else
+    errors+="$(basename "$f"): ${err:-share failed}"$'\n'
+  fi
+done <<< "${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}"
+
+if [[ -n $errors ]]; then
+  notify-send -u critical "Send to phone" "Sent $sent file(s). Failed:"$'\n'"$errors"
+else
+  notify-send "Send to phone" "Sent $sent file(s) to the phone's Download folder."
+fi

@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Keep the KDE Connect phone filesystem mounted and keep ~/Phone pointing at it.
+#
+# KDE Connect only mounts the phone on demand (when you click "Browse device"),
+# and never restores the mount after the phone sleeps or leaves the network.
+# There is no CLI for mounting, so this drives the sftp plugin over D-Bus.
+set -uo pipefail
+
+DEVICE_ID="${1:-${KDECONNECT_DEVICE_ID:-150d0bca93184e81b4433787ea73d461}}"
+LINK="${KDECONNECT_LINK:-$HOME/Phone}"
+INTERVAL="${KDECONNECT_INTERVAL:-15}"
+
+# The mount root is the phone's "/", where Android allows no writes. Everything
+# useful (and writable) lives under this subdirectory.
+SUBDIR="storage/emulated/0"
+
+DEV_PATH="/modules/kdeconnect/devices/$DEVICE_ID"
+SFTP="org.kde.kdeconnect.device.sftp"
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+sftp_call() {
+  timeout 10 gdbus call --session --dest org.kde.kdeconnect \
+    --object-path "$DEV_PATH/sftp" --method "$SFTP.$1" 2>&1
+}
+
+# Strips the gdbus tuple syntax: ('/some/path',) -> /some/path
+unwrap() { sed -n "s/^('\(.*\)',)$/\1/p"; }
+
+is_reachable() {
+  local out
+  out=$(timeout 10 gdbus call --session --dest org.kde.kdeconnect \
+    --object-path "$DEV_PATH" --method org.freedesktop.DBus.Properties.Get \
+    org.kde.kdeconnect.device isReachable 2>/dev/null) || return 1
+  [[ $out == *true* ]]
+}
+
+is_mounted() { [[ $(sftp_call isMounted) == *true* ]]; }
+
+mount_point() { sftp_call mountPoint | unwrap; }
+
+# A mount can survive in the kernel while the sshfs session behind it is dead.
+is_healthy() {
+  local mp="$1"
+  [[ -n $mp ]] || return 1
+  findmnt -t fuse.sshfs "$mp" >/dev/null 2>&1 || return 1
+  timeout 5 stat -t "$mp/$SUBDIR" >/dev/null 2>&1
+}
+
+refresh_link() {
+  local target="$1/$SUBDIR"
+  if [[ -L $LINK ]]; then
+    [[ $(readlink "$LINK") == "$target" ]] && return
+  elif [[ -e $LINK ]]; then
+    log "WARNING $LINK is not a symlink, leaving it alone"
+    return
+  fi
+  ln -sfn "$target" "$LINK" && log "linked $LINK -> $target"
+}
+
+drop_link() {
+  if [[ -L $LINK && ! -e $LINK ]]; then
+    rm -f "$LINK" && log "removed dangling $LINK"
+  fi
+}
+
+if ! gdbus wait --session --timeout 60 org.kde.kdeconnect; then
+  log "kdeconnectd did not appear on the session bus within 60s"
+  exit 1
+fi
+log "watching $DEVICE_ID every ${INTERVAL}s"
+
+state=start
+while :; do
+  if is_reachable; then
+    if is_mounted; then
+      mp=$(mount_point)
+      if is_healthy "$mp"; then
+        [[ $state == mounted ]] || log "mounted at $mp"
+        state=mounted
+        refresh_link "$mp"
+      else
+        log "mount at ${mp:-?} is stale, unmounting"
+        sftp_call unmount >/dev/null
+        drop_link
+        state=stale
+      fi
+    else
+      out=$(sftp_call mountAndWait)
+      if [[ $out == *true* ]]; then
+        mp=$(mount_point)
+        log "mounted at $mp"
+        state=mounted
+        refresh_link "$mp"
+      else
+        if [[ $state != failed ]]; then
+          log "mount failed: $out $(sftp_call getMountError | unwrap)"
+        fi
+        state=failed
+      fi
+    fi
+  else
+    if is_mounted; then
+      log "device unreachable, unmounting"
+      sftp_call unmount >/dev/null
+    fi
+    [[ $state == unreachable ]] || log "device unreachable"
+    state=unreachable
+    drop_link
+  fi
+  sleep "$INTERVAL"
+done
